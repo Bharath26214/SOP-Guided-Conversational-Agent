@@ -1,0 +1,28 @@
+define bot refuse off topic
+  "I can only help with this insurance claims call. Please share identity details or a question about your claim. If you keep asking unrelated questions, I will connect you with a human representative."
+
+define user ask weather
+  "what's the weather today"
+  "what is the weather today"
+  "how's the weather"
+  "how is the weather"
+  "is it raining"
+  "is it going to snow"
+  "what's the temperature outside"
+  "give me a weather forecast"
+
+define user ask trivia
+  "what is RL"
+  "what is reinforcement learning"
+  "tell me a joke"
+  "who won the game"
+  "write me some python code"
+  "what's 2 + 2"
+  "recommend a movie"
+  "what's the capital of France"
+
+define flow check off topic
+  $off_topic = execute check_off_topic
+  if $off_topic
+    bot refuse off topic
+    stop
