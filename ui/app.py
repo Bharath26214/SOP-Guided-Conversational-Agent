@@ -162,7 +162,6 @@ with st.sidebar:
         help="Required. Paste a Groq API key to use the demo.",
     )
     st.markdown(f"Need a key? [Create one at Groq]({GROQ_KEY_URL})")
-    st.caption(f"Backend: `{BACKEND_URL}`")
     st.caption(f"Model: `{GROQ_MODEL}`")
     st.caption(f"Fallback: `{GROQ_FALLBACK_MODEL}`")
     st.button("Reset conversation", on_click=_reset_chat)
