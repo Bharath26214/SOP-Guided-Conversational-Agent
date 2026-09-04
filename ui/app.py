@@ -1,68 +1,90 @@
 from __future__ import annotations
 
-import importlib
+import json
 import sys
 import time
-from copy import deepcopy
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+import httpx
 import streamlit as st
 
-from app.config import GROQ_FALLBACK_MODEL, GROQ_MODEL, LOGFIRE_TOKEN, resolve_groq_api_key
+from app.config import BACKEND_URL, GROQ_FALLBACK_MODEL, GROQ_MODEL, LOGFIRE_TOKEN
 
-import logfire
-
-from app import main as main_mod
-from app.agents.nodes import extractor as extractor_mod
-from app.agents.nodes import post_process as post_process_mod
-from app.agents.nodes import process_case as process_case_mod
-from app.agents.nodes import resolve_intent as resolve_intent_mod
-from app.agents.nodes import state as state_mod
-from app.agents.nodes import verify_id as verify_id_mod
-from app.agents.tools import email as email_tool_mod
-
-state_mod = importlib.reload(state_mod)
-email_tool_mod = importlib.reload(email_tool_mod)
-extractor_mod = importlib.reload(extractor_mod)
-verify_id_mod = importlib.reload(verify_id_mod)
-resolve_intent_mod = importlib.reload(resolve_intent_mod)
-post_process_mod = importlib.reload(post_process_mod)
-process_case_mod = importlib.reload(process_case_mod)
-main_mod = importlib.reload(main_mod)
-
-INITIAL_STATE = state_mod.INITIAL_STATE
-iter_reply = main_mod.iter_reply
 WORD_DELAY_SECONDS = 0.02
-
-
-def _typewriter(text: str):
-    words = text.split()
-    for index, word in enumerate(words):
-        yield word if index == 0 else f" {word}"
-        time.sleep(WORD_DELAY_SECONDS)
-
-
-GREETING = (
-    "Hello, this is insurance claims support. I can help with an existing claim. "
-    "First I need to verify your identity with any 3 of: full name, date of birth, "
-    "phone number, email address, or the last four digits of your SSN."
+FALLBACK_GREETING = (
+    "Hi, I can help with an existing insurance claim. "
+    "I will confirm your identity first, then we can look at your case. "
+    "You can start with your name, or any other details you have handy."
 )
 
 
+def _typewriter(text: str):
+    first = True
+    for part in text.splitlines(keepends=True):
+        if part.startswith("\n") or part == "":
+            yield part
+            first = True
+            continue
+        words = part.split()
+        suffix = "\n" if part.endswith("\n") else ""
+        for index, word in enumerate(words):
+            yield word if first else f" {word}"
+            first = False
+            time.sleep(WORD_DELAY_SECONDS)
+        if suffix:
+            yield suffix
+            first = True
+
+
+def _backend_session() -> dict:
+    response = httpx.get(f"{BACKEND_URL.rstrip('/')}/v1/session", timeout=10.0)
+    response.raise_for_status()
+    return response.json()
+
+
+def _iter_backend(user_text: str, state: dict, api_key: str):
+    with httpx.Client(timeout=180.0) as client:
+        with client.stream(
+            "POST",
+            f"{BACKEND_URL.rstrip('/')}/v1/chat/stream",
+            json={"user_text": user_text, "state": state, "api_key": api_key or None},
+        ) as response:
+            response.raise_for_status()
+            buffer = ""
+            for chunk in response.iter_text():
+                buffer += chunk
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    for line in block.splitlines():
+                        if line.startswith("data: "):
+                            yield json.loads(line[6:])
+
+
 def _init_session() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": GREETING}]
-    if "agent_state" not in st.session_state:
-        st.session_state.agent_state = deepcopy(INITIAL_STATE)
+    if "messages" in st.session_state and "agent_state" in st.session_state:
+        return
+    try:
+        session = _backend_session()
+        st.session_state.backend_ok = True
+        st.session_state.backend_error = ""
+        greeting = session.get("greeting") or FALLBACK_GREETING
+        st.session_state.agent_state = session.get("state") or {}
+    except Exception as exc:
+        st.session_state.backend_ok = False
+        st.session_state.backend_error = str(exc)
+        greeting = FALLBACK_GREETING
+        st.session_state.agent_state = {}
+    st.session_state.messages = [{"role": "assistant", "content": greeting}]
 
 
 def _reset_chat() -> None:
-    st.session_state.messages = [{"role": "assistant", "content": GREETING}]
-    st.session_state.agent_state = deepcopy(INITIAL_STATE)
+    st.session_state.pop("messages", None)
+    st.session_state.pop("agent_state", None)
+    _init_session()
 
 
 st.set_page_config(page_title="SOP Claims Agent", page_icon="📋", layout="centered")
@@ -77,8 +99,9 @@ with st.sidebar:
         "Groq API key",
         type="password",
         placeholder="gsk_...",
-        help="Paste your own Groq key to test. If empty, the app uses GROQ_API_KEY from .env.",
+        help="Paste your own Groq key to test. If empty, the backend uses GROQ_API_KEY from .env.",
     )
+    st.caption(f"Backend: `{BACKEND_URL}`")
     st.caption(f"Model: `{GROQ_MODEL}`")
     st.caption(f"Fallback: `{GROQ_FALLBACK_MODEL}`")
     st.caption(
@@ -87,6 +110,13 @@ with st.sidebar:
         else "Logfire: console only unless LOGFIRE_TOKEN is set or you ran `logfire projects use`"
     )
     st.button("Reset conversation", on_click=_reset_chat)
+
+if not st.session_state.get("backend_ok", True):
+    st.error(
+        f"Cannot reach the FastAPI backend at {BACKEND_URL}. "
+        "Start it with `poetry run uvicorn app.api:app --reload --port 8000`. "
+        f"({st.session_state.get('backend_error')})"
+    )
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -103,23 +133,22 @@ if prompt := st.chat_input("Ask about a claim…"):
 
         def _chunks():
             try:
-                for event in iter_reply(
-                    user_text=prompt,
-                    state=st.session_state.agent_state,
-                    api_key=resolve_groq_api_key(groq_api_key),
-                ):
-                    if event.kind == "status" and event.text:
-                        status.update(label=event.text, state="running")
-                    elif event.kind == "text" and event.text.strip():
+                for event in _iter_backend(prompt, st.session_state.agent_state, groq_api_key):
+                    kind = event.get("kind")
+                    text = (event.get("text") or "").strip()
+                    if kind == "status" and text:
+                        status.update(label=text, state="running")
+                    elif kind == "text" and text:
                         if streamed["started"]:
-                            yield " "
+                            yield "\n\n"
                         streamed["started"] = True
-                        yield from _typewriter(event.text.strip())
-                    elif event.kind == "done" and event.state is not None:
-                        streamed["state"] = event.state
+                        yield from _typewriter(text)
+                    elif kind == "done" and event.get("state") is not None:
+                        streamed["state"] = event["state"]
+                    elif kind == "error":
+                        raise RuntimeError(text or "The backend could not complete that turn.")
                 status.update(label="Done", state="complete")
-            except Exception as exc:
-                logfire.error("chat turn failed", error_type=type(exc).__name__)
+            except Exception:
                 status.update(label="Turn failed", state="error")
                 raise
 

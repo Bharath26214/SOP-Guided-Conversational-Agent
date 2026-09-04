@@ -15,6 +15,8 @@ from app.config import (
 )
 
 _active_groq_api_key = ""
+_scope_phase = "VERIFY_ID"
+_last_agent_reply = ""
 
 GUARDRAILS_DIR = Path(__file__).resolve().parent
 STOPWORDS = {
@@ -48,6 +50,14 @@ last_hit: dict[str, Any] = {"category": None, "source": None, "matched_example":
 def set_groq_api_key(api_key: str | None) -> None:
     global _active_groq_api_key
     _active_groq_api_key = resolve_groq_api_key(api_key)
+
+
+def set_scope_context(*, phase: str | None = None, last_agent_reply: str | None = None) -> None:
+    global _scope_phase, _last_agent_reply
+    if phase:
+        _scope_phase = phase
+    if last_agent_reply is not None:
+        _last_agent_reply = last_agent_reply
 
 
 def reset_last_hit() -> None:
@@ -144,8 +154,47 @@ def _looks_like_claims_turn(utterance: str) -> bool:
         "representative",
         "email",
         "summary",
+        "verify",
+        "identity",
+        "last four",
+        "phone number",
+        "my name",
     )
     return any(hint in text for hint in hints)
+
+
+def _looks_like_sop_turn(utterance: str) -> bool:
+    text = (utterance or "").strip().lower()
+    if not text:
+        return True
+    if text in {
+        "hi",
+        "hello",
+        "hey",
+        "yes",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
+        "sure",
+        "continue",
+        "please",
+        "thanks",
+        "thank you",
+        "send",
+        "skip",
+        "no",
+        "nope",
+    }:
+        return True
+    if _looks_like_claims_turn(utterance):
+        return True
+    from app.agents.identity_parse import parse_identity_utterance
+
+    parsed = parse_identity_utterance(utterance)
+    if parsed:
+        return True
+    return False
 
 
 def _prompt_guard_models() -> list[str]:
@@ -289,11 +338,23 @@ async def check_prompt_injection(context: dict | None = None) -> bool:
 @action(name="check_off_topic", is_system_action=True)
 async def check_off_topic(context: dict | None = None) -> bool:
     user_text = _user_message(context)
-    if _looks_like_claims_turn(user_text):
+    if _looks_like_sop_turn(user_text):
         return False
     example = first_matching_example(user_text, _off_topic_examples())
     if example:
         _mark("off_topic", "colang", example)
         logfire.info("Colang off-topic rail matched")
+        return True
+    from app.agents.llm import classify_scope
+
+    scope = classify_scope(
+        user_text,
+        _active_groq_api_key,
+        phase=_scope_phase,
+        last_agent_reply=_last_agent_reply,
+    )
+    if scope == "off_topic":
+        _mark("off_topic", "scope")
+        logfire.info("Scope classifier marked turn off-topic")
         return True
     return False

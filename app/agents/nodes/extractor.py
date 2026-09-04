@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 # Load .env and configure Logfire before LangChain so OTEL tracing is enabled.
@@ -11,7 +12,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 
-from app.agents.nodes.state import AgentMemory, AgentState, CaseHint, merge_dicts, merge_unique
+from app.agents.identity_parse import normalize_dob, normalize_phone, parse_identity_utterance
+from app.agents.nodes.state import AgentState, merge_dicts
+from app.memory import CASE_HINT_FIELDS, record_affect, record_extraction
 
 IN_SCOPE_REPLY = (
     "I have noted that. I still need to verify your identity before I can discuss "
@@ -19,7 +22,6 @@ IN_SCOPE_REPLY = (
 )
 
 IDENTITY_FIELDS = ("name", "dob", "phone", "email", "ssn_last4", "policy_number")
-CASE_HINT_FIELDS = ("case_id", "case_type", "status", "month", "year", "summary_text")
 
 
 class TurnExtraction(BaseModel):
@@ -63,14 +65,44 @@ Copy values that appear in the utterance. Examples:
 - I do not want to give my SSN -> declined_ssn=true (still in scope)
 - denied healthcare claim from January -> status=denied, case_type=healthcare, month=January
 
-In scope: identity, policy, representative authorization, claim status, case id, case type, dates, documents, denial, this call, SSN privacy questions.
-Store case and intent details even if identity is incomplete or unverified.
+Copy only values that appear in the utterance. Do not invent a claim id, claim type, status, month, or year. Identity alone (name, date of birth, phone, email, SSN) is not a claim identifier.
 Use null when a field is absent. intent_hints may include status_inquiry, denial_question, document_submission, next_steps, policy_question, claim_issue.
 """
 
 
 def _compact(data: dict) -> dict:
     return {key: value for key, value in data.items() if value not in (None, "", [], {})}
+
+
+def _mentioned_in_utterance(user_text: str, value: str) -> bool:
+    text = (user_text or "").lower()
+    needle = str(value).strip().lower()
+    if not needle:
+        return False
+    if needle in text:
+        return True
+    compact_text = re.sub(r"[^a-z0-9]+", "", text)
+    compact_needle = re.sub(r"[^a-z0-9]+", "", needle)
+    return bool(compact_needle) and compact_needle in compact_text
+
+
+def _ground_intent_hints(user_text: str, hints: list[str]) -> list[str]:
+    text = (user_text or "").lower()
+    allowed: list[str] = []
+    for hint_name in hints:
+        if hint_name == "claim_issue" and any(token in text for token in ("claim", "cl-", "case id", "caseid")):
+            allowed.append(hint_name)
+        elif hint_name == "denial_question" and any(token in text for token in ("denied", "denial")):
+            allowed.append(hint_name)
+        elif hint_name == "status_inquiry" and "status" in text:
+            allowed.append(hint_name)
+        elif hint_name == "document_submission" and any(token in text for token in ("document", "upload", "submit")):
+            allowed.append(hint_name)
+        elif hint_name == "next_steps" and any(token in text for token in ("next step", "what now", "appeal")):
+            allowed.append(hint_name)
+        elif hint_name == "policy_question" and "policy" in text:
+            allowed.append(hint_name)
+    return list(dict.fromkeys(allowed))
 
 
 def _model_unavailable(exc: Exception) -> bool:
@@ -126,13 +158,31 @@ def extract_turn(user_text: str, state: AgentState, api_key: str | None = None) 
                         break
                     continue
         raise RuntimeError(
-            f"Qwen 27B ({GROQ_MODEL}) and OSS 20B fallback ({GROQ_FALLBACK_MODEL}) are unavailable."
+            f"GPT-OSS 120B ({GROQ_MODEL}) and OSS 20B fallback ({GROQ_FALLBACK_MODEL}) are unavailable."
         ) from last_error
 
 
 def overlay_utterance_rules(user_text: str, extracted: TurnExtraction) -> TurnExtraction:
     text = user_text.lower()
     data = extracted.model_copy()
+    parsed = parse_identity_utterance(user_text)
+    hints: list[str] = []
+    for field, value in parsed.items():
+        setattr(data, field, value)
+    for field in CASE_HINT_FIELDS:
+        current = getattr(data, field, None)
+        if not current:
+            continue
+        if parsed.get(field) or _mentioned_in_utterance(user_text, current):
+            continue
+        setattr(data, field, None)
+    if parsed.get("case_id") or parsed.get("case_type") or parsed.get("status"):
+        hints.append("claim_issue")
+    if parsed.get("status") == "denied":
+        hints.append("denial_question")
+    if "status" in text and "claim" in text:
+        hints.append("status_inquiry")
+    data.intent_hints = _ground_intent_hints(user_text, list(dict.fromkeys([*(data.intent_hints or []), *hints])))
     has_ssn_word = any(token in text for token in ("ssn", "social security", "social"))
     decline = any(
         token in text
@@ -183,14 +233,15 @@ def overlay_utterance_rules(user_text: str, extracted: TurnExtraction) -> TurnEx
 def apply_extraction(state: AgentState, extracted: TurnExtraction) -> AgentState:
     updated: AgentState = {**state}
     payload = extracted.model_dump()
-    existing_memory: AgentMemory = dict(state.get("memory") or {})
     existing_role = state.get("caller_role")
     role = payload.get("caller_role") or existing_role
 
     identity = _compact({field: payload.get(field) for field in IDENTITY_FIELDS})
+    if identity.get("dob"):
+        identity["dob"] = normalize_dob(str(identity["dob"])) or identity["dob"]
+    if identity.get("phone"):
+        identity["phone"] = normalize_phone(str(identity["phone"])) or identity["phone"]
     if role == "representative":
-        if payload.get("name"):
-            existing_memory["representative_name"] = payload["name"]
         if payload.get("member_name"):
             identity["name"] = payload["member_name"]
             identity["member_name"] = payload["member_name"]
@@ -199,24 +250,21 @@ def apply_extraction(state: AgentState, extracted: TurnExtraction) -> AgentState
     updated["identity"] = merge_dicts(state.get("identity"), identity)
     if role:
         updated["caller_role"] = role
-    if payload.get("relationship"):
-        existing_memory["relationship"] = payload["relationship"]
-    if payload.get("declined_ssn"):
-        existing_memory["declined_ssn"] = True
-    if payload.get("ssn_last4"):
-        existing_memory["declined_ssn"] = False
 
-    existing_hint: CaseHint = dict(existing_memory.get("case_hint") or {})
-    new_hint = _compact({field: payload.get(field) for field in CASE_HINT_FIELDS})
-    if new_hint:
-        existing_memory["case_hint"] = merge_dicts(existing_hint, new_hint)
-    if extracted.intent_hints:
-        existing_memory["intent_hints"] = merge_unique(
-            existing_memory.get("intent_hints"),
-            extracted.intent_hints,
-        )
-    updated["memory"] = existing_memory
-    return updated
+    declined: bool | None = None
+    if payload.get("declined_ssn"):
+        declined = True
+    if payload.get("ssn_last4"):
+        declined = False
+    return record_extraction(
+        updated,
+        representative_name=payload.get("name") if role == "representative" else None,
+        relationship=payload.get("relationship"),
+        declined_ssn=declined,
+        policy_number=updated["identity"].get("policy_number"),
+        case_hint=_compact({field: payload.get(field) for field in CASE_HINT_FIELDS}) or None,
+        intent_hints_in=extracted.intent_hints or None,
+    )
 
 
 def extract_and_apply(
@@ -229,9 +277,13 @@ def extract_and_apply(
         if state.get("phase") in {"HUMAN_ESCALATION", "DONE"}:
             span.set_attribute("skipped", True)
             return state, None
-        extracted = overlay_utterance_rules(
-            user_text, extract_turn(user_text, state, api_key=api_key)
-        )
+        extracted = TurnExtraction()
+        try:
+            extracted = extract_turn(user_text, state, api_key=api_key)
+        except Exception as exc:
+            span.set_attribute("llm_extract_failed", True)
+            logfire.warning("extractor.llm_failed", error_type=type(exc).__name__)
+        extracted = overlay_utterance_rules(user_text, extracted)
         payload = extracted.model_dump()
         present_fields = [
             field
@@ -242,6 +294,7 @@ def extract_and_apply(
         span.set_attribute("caller_role", extracted.caller_role)
         span.set_attribute("extracted_fields", present_fields)
         updated = apply_extraction(state, extracted)
+        updated = record_affect(updated, user_text)
         span.set_attributes(safe_state_attrs(updated))
         return updated, extracted
 

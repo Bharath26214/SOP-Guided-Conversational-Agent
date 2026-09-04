@@ -14,7 +14,7 @@ def _clean_env(value: str | None) -> str:
 
 
 GROQ_API_KEY = _clean_env(os.getenv("GROQ_API_KEY"))
-GROQ_MODEL = "qwen/qwen3.8-27b"
+GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
 LOGFIRE_TOKEN = _clean_env(os.getenv("LOGFIRE_TOKEN"))
 PROMPT_GUARD_MODEL = _clean_env(os.getenv("PROMPT_GUARD_MODEL")) or "meta-llama/llama-prompt-guard-2-86m"
@@ -22,6 +22,9 @@ PROMPT_GUARD_FALLBACK_MODEL = (
     _clean_env(os.getenv("PROMPT_GUARD_FALLBACK_MODEL")) or "meta-llama/llama-prompt-guard-2-22m"
 )
 DUMMY_EMAIL_FROM = _clean_env(os.getenv("DUMMY_EMAIL_FROM")) or "claims-support@example.com"
+BACKEND_HOST = _clean_env(os.getenv("BACKEND_HOST")) or "127.0.0.1"
+BACKEND_PORT = int(_clean_env(os.getenv("BACKEND_PORT")) or "8000")
+BACKEND_URL = _clean_env(os.getenv("BACKEND_URL")) or f"http://{BACKEND_HOST}:{BACKEND_PORT}"
 
 os.environ.setdefault("LANGSMITH_OTEL_ENABLED", "true")
 os.environ.setdefault("LANGSMITH_OTEL_ONLY", "true")

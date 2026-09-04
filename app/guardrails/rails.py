@@ -10,6 +10,8 @@ from nemoguardrails import LLMRails, RailsConfig
 
 from app.agents.nodes.state import AgentState
 from app.guardrails import actions as guardrail_actions
+from app.memory import get as memory_get
+from app.memory import hint as case_hint
 from app.observability import log_current_node
 
 GUARDRAILS_DIR = Path(__file__).resolve().parent
@@ -17,27 +19,49 @@ RailCategory = Literal["off_topic", "jailbreak", "prompt_injection"]
 RAIL_LIMIT = 3
 
 OFF_TOPIC_REPLY = (
-    "I can only help with this insurance claims call. Please share identity details "
-    "or a question about your claim. If you keep asking unrelated questions, I will "
-    "connect you with a human representative."
+    "I am happy to help with your insurance claim, but I cannot cover that topic. "
+    "If you have a question about your identity check or your claim, I can take that. "
+    "If you would rather speak with a person, I can connect you with a human representative."
 )
 JAILBREAK_REPLY = (
-    "I cannot change my role or ignore my instructions. I can only help with this "
-    "insurance claims call."
+    "I need to stay on this insurance claims call and cannot change my role. "
+    "I can help with identity verification or your claim, or connect you with a person."
 )
 PROMPT_INJECTION_REPLY = (
-    "I cannot follow injected instructions. I can only help with this insurance claims call."
+    "I cannot follow those extra instructions. I can help with this insurance claims call, "
+    "or connect you with a human representative if you prefer."
 )
 ESCALATION_REPLY = (
-    "I am connecting you with a human representative, who can take it from here."
+    "Of course. I will connect you with a human representative now. "
+    "Thank you for your patience — they will take it from here."
 )
-ALREADY_ESCALATED_REPLY = "A human representative will take it from here."
+ALREADY_ESCALATED_REPLY = (
+    "A human representative will take it from here. Thank you for waiting."
+)
 
 REPLIES: dict[str, str] = {
     "off_topic": OFF_TOPIC_REPLY,
     "jailbreak": JAILBREAK_REPLY,
     "prompt_injection": PROMPT_INJECTION_REPLY,
 }
+
+
+def off_topic_reply(state: AgentState | None = None) -> str:
+    stored = case_hint(state)
+    noted = ""
+    if stored.get("case_id"):
+        noted = f"I still have claim {stored['case_id']} noted for after identity verification. "
+    elif stored.get("month"):
+        month = str(stored["month"]).title()
+        noted = f"I still have your {month} claim noted for after identity verification. "
+    elif stored.get("case_type") or stored.get("status"):
+        noted = "I still have the claim details you shared noted for after identity verification. "
+    return (
+        f"{noted}"
+        "I cannot help with that other question. "
+        "Please share identity details so we can continue with your claim, "
+        "or I can connect you with a human representative."
+    )
 
 
 @dataclass(frozen=True)
@@ -60,11 +84,26 @@ def _rails() -> LLMRails:
     return rails
 
 
-def screen_user_turn(user_text: str, api_key: str | None = None) -> RailDecision:
+def screen_user_turn(
+    user_text: str,
+    api_key: str | None = None,
+    *,
+    phase: str | None = None,
+    last_agent_reply: str | None = None,
+    state: AgentState | None = None,
+) -> RailDecision:
     with logfire.span("guardrails.screen") as span:
         log_current_node("guardrails")
         guardrail_actions.reset_last_hit()
         guardrail_actions.set_groq_api_key(api_key)
+        guardrail_actions.set_scope_context(
+            phase=phase or (state or {}).get("phase") or "VERIFY_ID",
+            last_agent_reply=(
+                last_agent_reply
+                if last_agent_reply is not None
+                else str(memory_get(state, "last_agent_reply") or "")
+            ),
+        )
         try:
             _rails().generate(
                 messages=[{"role": "user", "content": user_text}],
@@ -90,7 +129,7 @@ def screen_user_turn(user_text: str, api_key: str | None = None) -> RailDecision
                 blocked=True,
                 category=category,
                 source=hit.get("source"),
-                message=REPLIES[category],
+                message=REPLIES.get(category) or OFF_TOPIC_REPLY,
             )
         logfire.info("Guardrail allowed user turn")
         return RailDecision(blocked=False)
@@ -130,4 +169,7 @@ def apply_rail_to_state(state: AgentState, decision: RailDecision) -> tuple[Agen
         updated["phase"] = "HUMAN_ESCALATION"
         logfire.warning("Guardrail limit reached; escalating to human")
         return updated, ESCALATION_REPLY
-    return updated, decision.message
+    message = decision.message
+    if decision.category == "off_topic":
+        message = off_topic_reply(updated)
+    return updated, message

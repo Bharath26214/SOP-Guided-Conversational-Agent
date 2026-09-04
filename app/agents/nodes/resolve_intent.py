@@ -7,12 +7,8 @@ import logfire
 
 from app.agents.nodes.state import AgentState
 from app.data_loaders.queries import get_claim, get_claims_for_party
+from app.memory import hint, intent_hints, recalled_refs
 from app.observability import log_current_node, safe_state_attrs
-
-ASK_DIFFICULTY = (
-    "What difficulty are you facing today — a problem with a specific claim, "
-    "a policy question, or a claim status update?"
-)
 MONTHS = {
     "january": "01",
     "jan": "01",
@@ -42,11 +38,11 @@ MONTHS = {
 
 
 def _hint(state: AgentState) -> dict[str, Any]:
-    return dict((state.get("memory") or {}).get("case_hint") or {})
+    return hint(state)
 
 
 def _intent_hints(state: AgentState) -> list[str]:
-    return [str(item).lower() for item in ((state.get("memory") or {}).get("intent_hints") or [])]
+    return intent_hints(state)
 
 
 def _normalize_month(value: str | None) -> str | None:
@@ -71,6 +67,26 @@ def _claim_month(claim: dict[str, Any]) -> str:
 def _claim_year(claim: dict[str, Any]) -> str:
     created = str(claim.get("created_at") or "")
     return created[:4] if len(created) >= 4 else ""
+
+
+def _caller_named_claim(hint: dict[str, Any]) -> bool:
+    return any(hint.get(field) for field in ("case_id", "case_type", "status", "month", "year"))
+
+
+def _confirms_listed_claim(user_text: str) -> bool:
+    text = (user_text or "").strip().lower().rstrip(".!")
+    return text in {
+        "yes",
+        "yeah",
+        "yep",
+        "correct",
+        "confirm",
+        "that one",
+        "that's the one",
+        "thats the one",
+        "that's it",
+        "that is the one",
+    }
 
 
 def infer_intent(state: AgentState) -> str | None:
@@ -142,11 +158,24 @@ def filter_claims(claims: list[dict[str, Any]], hint: dict[str, Any]) -> list[di
     return results
 
 
-def _brief(claim: dict[str, Any]) -> str:
-    return (
-        f"{claim.get('case_id')} ({claim.get('case_type')}, {claim.get('status')}, "
-        f"{claim.get('created_at')})"
-    )
+def _brief(claim: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "case_id": claim.get("case_id"),
+        "case_type": claim.get("case_type"),
+        "status": claim.get("status"),
+        "created_at": claim.get("created_at"),
+    }
+
+
+def _facts(state: AgentState | None, extra: dict[str, Any]) -> dict[str, Any]:
+    refs = recalled_refs(state)
+    return {
+        "phase": "RESOLVE_INTENT",
+        "verified": True,
+        "recalled_policy_number": refs.get("policy_number"),
+        "recalled_case_id": refs.get("case_id"),
+        **extra,
+    }
 
 
 def _select_claim(state: AgentState, claim: dict[str, Any], intent: str) -> AgentState:
@@ -159,141 +188,109 @@ def _select_claim(state: AgentState, claim: dict[str, Any], intent: str) -> Agen
     return updated
 
 
-def _ask_for_claim_id(state: AgentState, candidates: list[dict[str, Any]], intent: str) -> tuple[AgentState, str]:
+def _ask_for_claim_id(
+    state: AgentState,
+    candidates: list[dict[str, Any]],
+    intent: str,
+) -> tuple[AgentState, dict[str, Any]]:
     updated: AgentState = {**state}
     ids = [str(claim.get("case_id")) for claim in candidates if claim.get("case_id")]
     updated["candidate_case_ids"] = ids
     updated["selected_case_id"] = None
     updated["intent"] = intent
     updated["phase"] = "RESOLVE_INTENT"
-    listed = ", ".join(_brief(claim) for claim in candidates)
-    case_type = candidates[0].get("case_type") if candidates else "matching"
-    return (
+    return updated, _facts(
         updated,
-        (
-            f"I found more than one {case_type} claim on this policy: {listed}. "
-            "Please share the claim ID so I can help with the right one."
-        ),
+        {"status": "need_claim_id", "candidates": [_brief(claim) for claim in candidates]},
     )
 
 
-def run_resolve_intent(state: AgentState) -> tuple[AgentState, str]:
+def run_resolve_intent(state: AgentState, user_text: str = "") -> tuple[AgentState, dict[str, Any]]:
     log_current_node("resolve_intent", state)
     with logfire.span("resolve_intent.run", **safe_state_attrs(state)) as span:
-        updated, message = _run_resolve_intent(state)
+        updated, facts = _run_resolve_intent(state, user_text)
         span.set_attributes(safe_state_attrs(updated))
         span.set_attribute("intent", updated.get("intent"))
         span.set_attribute("selected_case_id", updated.get("selected_case_id"))
-        return updated, message
+        return updated, facts
 
 
-def _run_resolve_intent(state: AgentState) -> tuple[AgentState, str]:
+def _run_resolve_intent(state: AgentState, user_text: str = "") -> tuple[AgentState, dict[str, Any]]:
     if not state.get("verified") or not state.get("party_id"):
-        return state, "I still need to verify your identity before I can look up a claim."
+        return state, _facts(state, {"status": "not_verified", "verified": False})
 
     if state.get("phase") == "PROCESS_CASE" and state.get("selected_case_id"):
-        return (
-            state,
-            f"I already have claim {state.get('selected_case_id')} selected.",
-        )
+        return state, {}
 
+    refs = recalled_refs(state)
     intent = infer_intent(state)
     updated: AgentState = {**state, "phase": "RESOLVE_INTENT"}
+    named = _caller_named_claim(_hint(updated))
+    if intent is None and (refs.get("case_id") or named):
+        intent = "claim_issue"
     if intent:
         updated["intent"] = intent
 
     if intent is None:
         updated["intent"] = None
-        return updated, ASK_DIFFICULTY
+        return updated, _facts(updated, {"status": "ask_intent"})
 
     if intent == "policy_inquiry":
         updated["selected_case_id"] = None
         updated["selected_case_type"] = None
         updated["candidate_case_ids"] = []
         updated["phase"] = "PROCESS_CASE"
-        return updated, "I understand this is a policy question. I will help with that next."
+        return updated, {}
 
     hint = _hint(updated)
     party_id = str(updated.get("party_id"))
     claims = get_claims_for_party(party_id)
     if not claims:
-        return updated, "I do not have an existing claim on file for this policy. Please share a claim ID if you have one."
+        return updated, _facts(updated, {"status": "no_claims", "searched_memory": True})
 
-    if hint.get("case_id"):
-        offered = str(hint["case_id"]).strip().upper()
-        owned = get_claim(offered)
-        if owned is None or owned.get("party_id") != party_id:
-            known = ", ".join(claim.get("case_id") or "" for claim in claims)
-            return (
-                updated,
-                (
-                    "That claim ID is not on this policy. "
-                    f"Please share one of: {known}."
-                ),
-            )
-        selected = _select_claim(updated, owned, intent)
-        return (
-            selected,
-            (
-                f"I have claim {owned.get('case_id')} "
-                f"({owned.get('case_type')}, {owned.get('status')}). I will help with that next."
-            ),
+    caller_id = str(hint.get("case_id") or "").strip().upper()
+    stored = get_claim(caller_id) if caller_id else None
+    if stored and stored.get("party_id") == party_id:
+        selected = _select_claim(updated, stored, intent)
+        return selected, _facts(updated, {"status": "selected", "claim": _brief(stored), "from_memory": True})
+    if caller_id:
+        return updated, _facts(
+            updated,
+            {
+                "status": "stored_claim_not_found",
+                "tried_case_id": caller_id,
+                "known_ids": [c.get("case_id") for c in claims],
+            },
         )
 
-    matched = filter_claims(claims, hint)
-    if len(matched) == 1:
-        claim = matched[0]
-        selected = _select_claim(updated, claim, intent)
-        noted = []
-        if hint.get("case_type"):
-            noted.append(str(hint["case_type"]))
-        if hint.get("status"):
-            noted.append(str(hint["status"]))
-        if hint.get("month"):
-            noted.append(str(hint["month"]))
-        noted_text = " ".join(noted) if noted else "your request"
-        return (
-            selected,
-            (
-                f"I used what you already shared about {noted_text} and matched claim "
-                f"{claim.get('case_id')} ({claim.get('case_type')}, {claim.get('status')}, "
-                f"{claim.get('created_at')}). I will help with that next."
-            ),
-        )
+    listed = [
+        claim
+        for claim in claims
+        if str(claim.get("case_id") or "").upper()
+        in {str(item).upper() for item in (updated.get("candidate_case_ids") or []) if item}
+    ]
+    if len(listed) == 1 and _confirms_listed_claim(user_text) and not named:
+        selected = _select_claim(updated, listed[0], intent)
+        return selected, _facts(updated, {"status": "selected", "claim": _brief(listed[0]), "confirmed": True})
 
-    if len(matched) > 1:
+    matched = filter_claims(claims, hint) if named else []
+    if named and len(matched) == 1:
+        selected = _select_claim(updated, matched[0], intent)
+        return selected, _facts(updated, {"status": "selected", "claim": _brief(matched[0])})
+
+    if named and len(matched) > 1:
         types = {str(claim.get("case_type") or "") for claim in matched}
         if len(types) == 1 or hint.get("case_type"):
             return _ask_for_claim_id(updated, matched, intent)
-        type_list = ", ".join(sorted(t for t in types if t))
         updated["candidate_case_ids"] = [
             str(claim.get("case_id")) for claim in matched if claim.get("case_id")
         ]
-        return (
+        return updated, _facts(
             updated,
-            (
-                "You have more than one kind of claim on file "
-                f"({type_list}). Please share the claim type or the claim ID."
-            ),
+            {"status": "need_type_or_id", "case_types": sorted(t for t in types if t)},
         )
 
-    if hint.get("case_type") or hint.get("status") or hint.get("month"):
-        return (
-            updated,
-            "I could not match those details to a claim on this policy. Please share the claim ID.",
-        )
+    if named:
+        return updated, _facts(updated, {"status": "no_match"})
 
-    types = {str(claim.get("case_type") or "") for claim in claims}
-    if len(types) == 1:
-        return _ask_for_claim_id(updated, claims, intent)
-    type_list = ", ".join(sorted(t for t in types if t))
-    updated["candidate_case_ids"] = [
-        str(claim.get("case_id")) for claim in claims if claim.get("case_id")
-    ]
-    return (
-        updated,
-        (
-            f"You have {len(claims)} claims on file ({type_list}). "
-            "Please share the claim type or the claim ID."
-        ),
-    )
+    return _ask_for_claim_id(updated, claims, intent)

@@ -1,5 +1,5 @@
 define bot refuse off topic
-  "I can only help with this insurance claims call. Please share identity details or a question about your claim. If you keep asking unrelated questions, I will connect you with a human representative."
+  "I am happy to help with your insurance claim, but I cannot cover that topic. If you have a question about your identity check or your claim, I can take that. If you would rather speak with a person, I can connect you with a human representative."
 
 define user ask weather
   "what's the weather today"
@@ -20,6 +20,12 @@ define user ask trivia
   "what's 2 + 2"
   "recommend a movie"
   "what's the capital of France"
+  "what should I cook for dinner"
+  "who is the president"
+  "play a song"
+  "how do I invest in stocks"
+  "translate this to spanish"
+  "what time is it"
 
 define flow check off topic
   $off_topic = execute check_off_topic

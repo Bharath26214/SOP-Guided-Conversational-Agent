@@ -9,13 +9,15 @@ poetry install
 cp .env.example .env
 ```
 
-Set `GROQ_API_KEY` in `.env`, then:
+Set `GROQ_API_KEY` in `.env`, then start the FastAPI backend and the Streamlit UI:
 
 ```bash
+poetry run uvicorn app.api:app --reload --port 8000
 poetry run streamlit run ui/app.py
 ```
 
-The UI is at http://localhost:8501.
+The API is at http://localhost:8000 (`/docs`, `/v1/session`, `/v1/chat`, `/v1/chat/stream`).  
+The UI is at http://localhost:8501 and routes every turn to that backend.
 
 ## Logfire observability
 

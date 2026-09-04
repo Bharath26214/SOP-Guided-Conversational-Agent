@@ -1,8 +1,10 @@
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+
+from app.memory import AgentMemory, CaseHint, merge_maps, merge_unique
 
 Phase = Literal[
     "VERIFY_ID",
@@ -16,17 +18,7 @@ Phase = Literal[
 CallerRole = Literal["policyholder", "representative"]
 EmailChoice = Literal["send", "skip"]
 
-
-def merge_dicts(left: dict[str, Any] | None, right: dict[str, Any] | None) -> dict[str, Any]:
-    return {**(left or {}), **(right or {})}
-
-
-def merge_unique(left: list[str] | None, right: list[str] | None) -> list[str]:
-    merged: list[str] = []
-    for item in [*(left or []), *(right or [])]:
-        if item not in merged:
-            merged.append(item)
-    return merged
+merge_dicts = merge_maps
 
 
 class IdentityFields(TypedDict, total=False):
@@ -39,37 +31,15 @@ class IdentityFields(TypedDict, total=False):
     member_name: str
 
 
-class CaseHint(TypedDict, total=False):
-    case_id: str
-    case_type: str
-    status: str
-    month: str
-    year: str
-    summary_text: str
-
-
-class AgentMemory(TypedDict, total=False):
-    intent_hints: list[str]
-    case_hint: CaseHint
-    declined_ssn: bool
-    representative_name: str
-    relationship: str
-    case_briefed: bool
-    awaiting_human_confirm: bool
-    process_topics: list[str]
-    case_answers: list[str]
-    email_offered: bool
-
-
 class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     phase: Phase
-    identity: Annotated[IdentityFields, merge_dicts]
+    identity: Annotated[IdentityFields, merge_maps]
     verified: bool
     matched_pii: Annotated[list[str], merge_unique]
     party_id: Optional[str]
     caller_role: Optional[CallerRole]
-    memory: Annotated[AgentMemory, merge_dicts]
+    memory: Annotated[AgentMemory, merge_maps]
     selected_case_id: Optional[str]
     selected_case_type: Optional[str]
     candidate_case_ids: list[str]

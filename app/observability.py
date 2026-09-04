@@ -9,6 +9,8 @@ os.environ.setdefault("LANGSMITH_TRACING", "true")
 
 import logfire
 
+from app.memory import flagged, hint
+
 _configured = False
 
 
@@ -17,7 +19,7 @@ def configure_logfire() -> None:
     if _configured:
         return
 
-    service_name = os.getenv("LOGFIRE_SERVICE_NAME") or "sop-claims-agent"
+    service_name = os.getenv("LOGFIRE_SERVICE_NAME")
     console_enabled = os.getenv("LOGFIRE_CONSOLE", "true").strip().lower() not in {
         "0",
         "false",
@@ -57,13 +59,15 @@ def safe_state_attrs(state: dict[str, Any] | None) -> dict[str, Any]:
         "matched_pii": list(state.get("matched_pii") or []),
         "out_of_scope_count": state.get("out_of_scope_count"),
         "identity_fields": sorted(identity.keys()),
-        "has_case_hint": bool((state.get("memory") or {}).get("case_hint")),
-        "declined_ssn": bool((state.get("memory") or {}).get("declined_ssn")),
+        "has_case_hint": bool(hint(state)),
+        "declined_ssn": flagged(state, "declined_ssn"),
         "intent": state.get("intent"),
         "selected_case_id": state.get("selected_case_id"),
         "candidate_case_ids": list(state.get("candidate_case_ids") or []),
         "email_choice": state.get("email_choice"),
-        "email_offered": bool((state.get("memory") or {}).get("email_offered")),
+        "email_offered": flagged(state, "email_offered"),
+        "affect": (state.get("memory") or {}).get("affect"),
+        "affect_tone": (state.get("memory") or {}).get("affect_tone"),
     }
 
 

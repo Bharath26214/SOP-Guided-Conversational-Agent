@@ -1,16 +1,31 @@
+"""SOP brain — LangGraph orchestration, LangChain phrasing.
+
+Phase order is code-gated. Nodes gather facts; a speak node writes the turn
+from the SOP system prompt. After a spoken reply the graph always stops.
+The next user message starts a new turn at the current phase.
+
+    guardrails → extractor → verify_id | resolve_intent | process_case | post_process
+                                                                         ↘ speak → END
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, Iterator, Literal
+from functools import lru_cache
+from typing import Any, Iterator, Literal
 
 import logfire
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
 
+from app.agents.llm import phrase
 from app.agents.nodes.extractor import extract_and_apply
 from app.agents.nodes.post_process import DONE_REPLY, run_post_process
 from app.agents.nodes.process_case import run_process_case
 from app.agents.nodes.resolve_intent import run_resolve_intent
-from app.agents.nodes.state import AgentState
+from app.agents.nodes.state import INITIAL_STATE, AgentState
 from app.agents.nodes.verify_id import run_verify_id
+from app.memory import affect_payload, get as memory_get, note_answer, patch as memory_patch
+from app.agents.prompts import PHASE_SYSTEM, SOP_SYSTEM
 from app.config import resolve_groq_api_key
 from app.guardrails.rails import (
     ALREADY_ESCALATED_REPLY,
@@ -27,16 +42,8 @@ SOP_FLOW = (
     "process_case",
     "post_process",
 )
-SOP_PHASE_NODES = ("verify_id", "resolve_intent", "process_case", "post_process")
 TERMINAL_PHASES = frozenset({"HUMAN_ESCALATION", "DONE"})
-MAX_SAME_TURN_HOPS = len(SOP_PHASE_NODES)
-
-HALTED_REPLY = (
-    "I could not complete that turn. I can connect you with a human representative."
-)
-
-Action = Literal["stop", "advance"]
-EventKind = Literal["status", "text", "done"]
+AGENT_KEYS = tuple(INITIAL_STATE.keys())
 
 NODE_STATUS = {
     "guardrails": "Checking this message…",
@@ -45,92 +52,66 @@ NODE_STATUS = {
     "resolve_intent": "Finding the claim…",
     "process_case": "Reviewing the claim file…",
     "post_process": "Wrapping up…",
+    "speak": "Writing the reply…",
     "human_escalation": "Connecting you with a human…",
+    "already_escalated": "Connecting you with a human…",
     "done": "Call complete",
 }
 
+EventKind = Literal["status", "text", "done"]
 
-@dataclass
-class Turn:
-    """One user utterance moving through the SOP."""
 
+class GraphState(TypedDict, total=False):
+    messages: list
+    phase: str
+    identity: dict
+    verified: bool
+    matched_pii: list
+    party_id: str | None
+    caller_role: str | None
+    memory: dict
+    selected_case_id: str | None
+    selected_case_type: str | None
+    candidate_case_ids: list
+    intent: str | None
+    out_of_scope_count: int
+    email_choice: str | None
     user_text: str
-    state: AgentState
     api_key: str
-    spoken: list[str] = field(default_factory=list)
-    outgoing: list[str] = field(default_factory=list)
-
-    def speak(self, message: str) -> None:
-        text = (message or "").strip()
-        if text:
-            self.spoken.append(text)
-            self.outgoing.append(text)
-
-    def remember(self, message: str) -> None:
-        self.speak(message)
-
-    def reply_text(self, *parts: str) -> str:
-        chunks = [*(self.spoken), *(part.strip() for part in parts if part and part.strip())]
-        return " ".join(chunks).strip()
+    last_reply: str
+    speak_facts: dict
+    halt: bool
+    current_node: str
 
 
-@dataclass(frozen=True)
 class ReplyEvent:
-    """One streamed update from the brain: status, spoken text, or the final state."""
-
-    kind: EventKind
-    text: str = ""
-    node: str | None = None
-    state: AgentState | None = None
-
-
-@dataclass(frozen=True)
-class Step:
-    """What a SOP step tells the brain to do next."""
-
-    action: Action
-    message: str | None = None
+    def __init__(
+        self,
+        kind: EventKind,
+        text: str = "",
+        node: str | None = None,
+        state: AgentState | None = None,
+    ) -> None:
+        self.kind = kind
+        self.text = text
+        self.node = node
+        self.state = state
 
 
-StepRunner = Callable[["Turn", object], Step]
+def _agent_state(data: dict[str, Any]) -> AgentState:
+    return {key: data.get(key, INITIAL_STATE[key]) for key in AGENT_KEYS}  # type: ignore[return-value]
 
 
-def _enter(node: str, state: AgentState, span) -> None:
-    span.set_attribute("current_node", node)
-    log_current_node(node, state)
-
-
-def _status(node: str) -> ReplyEvent:
-    return ReplyEvent(kind="status", text=NODE_STATUS.get(node, node), node=node)
-
-
-def _flush(turn: Turn, node: str) -> Iterator[ReplyEvent]:
-    for text in turn.outgoing:
-        yield ReplyEvent(kind="text", text=text, node=node)
-    turn.outgoing.clear()
-
-
-def _finish(span, node: str, state: AgentState, message: str) -> tuple[str, AgentState]:
-    span.set_attribute("outcome", node)
-    span.set_attributes(safe_state_attrs(state))
-    return message, state
-
-
-def _case_is_ready(state: AgentState) -> bool:
+def _case_is_ready(state: dict[str, Any]) -> bool:
     if state.get("phase") != "PROCESS_CASE":
         return False
     return bool(state.get("selected_case_id") or state.get("intent") == "policy_inquiry")
 
 
-def next_node(state: AgentState) -> str | None:
-    """Pick the SOP node that should run after extraction.
-
-    This is the routing contract. Nodes may set `phase` as a result of their
-    work; only this function maps that result onto the next runner.
-    """
+def next_node(state: dict[str, Any]) -> str:
     phase = state.get("phase")
-    if phase in TERMINAL_PHASES:
-        return None
+    if state.get("halt") or phase in TERMINAL_PHASES:
+        return END
     if not state.get("verified"):
         return "verify_id"
     if phase == "POST_PROCESS":
@@ -140,72 +121,206 @@ def next_node(state: AgentState) -> str | None:
     return "resolve_intent"
 
 
-def run_guardrails(turn: Turn, span) -> Step:
-    _enter("guardrails", turn.state, span)
-    decision = screen_user_turn(turn.user_text, api_key=turn.api_key)
+def _enter(node: str, state: dict[str, Any]) -> None:
+    log_current_node(node, state)
+
+
+def _sop_result(agent: AgentState, facts: dict[str, Any], node: str) -> dict[str, Any]:
+    """One spoken reply per user turn. Empty facts mean a silent handoff to the next node."""
+    terminal = agent.get("phase") in TERMINAL_PHASES
+    has_speech = bool(facts)
+    halt = True if has_speech or terminal else False
+    return {
+        **agent,
+        "speak_facts": {**affect_payload(agent), **facts} if has_speech else {},
+        "last_reply": "",
+        "halt": halt,
+        "current_node": node,
+    }
+
+
+def guardrails_node(state: GraphState) -> dict[str, Any]:
+    _enter("guardrails", state)
+    decision = screen_user_turn(
+        state.get("user_text") or "",
+        api_key=state.get("api_key"),
+        phase=str(state.get("phase") or "VERIFY_ID"),
+        last_agent_reply=str(memory_get(state, "last_agent_reply") or ""),
+        state=_agent_state(state),
+    )
     if not decision.blocked:
-        return Step("advance")
-    turn.state, message = apply_rail_to_state(turn.state, decision)
-    span.set_attribute("rail_source", decision.source)
-    span.set_attribute("outcome", decision.category or "blocked")
-    turn.speak(message)
-    return Step("stop", message)
+        return {"halt": False, "last_reply": "", "speak_facts": {}, "current_node": "guardrails"}
+    agent, message = apply_rail_to_state(_agent_state(state), decision)
+    agent = memory_patch(agent, last_agent_reply=message)
+    return {**agent, "halt": True, "last_reply": message, "speak_facts": {}, "current_node": "guardrails"}
 
 
-def run_extractor(turn: Turn, span) -> Step:
-    _enter("extractor", turn.state, span)
-    turn.state, extracted = extract_and_apply(turn.state, turn.user_text, api_key=turn.api_key)
+def extractor_node(state: GraphState) -> dict[str, Any]:
+    _enter("extractor", state)
+    agent, extracted = extract_and_apply(
+        _agent_state(state),
+        state.get("user_text") or "",
+        api_key=state.get("api_key"),
+    )
     if extracted is None:
-        _enter("human_escalation", turn.state, span)
-        turn.speak(ALREADY_ESCALATED_REPLY)
-        return Step("stop", ALREADY_ESCALATED_REPLY)
-    turn.state = {**turn.state, "out_of_scope_count": 0}
-    return Step("advance")
+        return {
+            **agent,
+            "halt": True,
+            "last_reply": ALREADY_ESCALATED_REPLY,
+            "speak_facts": {},
+            "current_node": "extractor",
+        }
+    return {
+        **agent,
+        "out_of_scope_count": 0,
+        "halt": False,
+        "last_reply": "",
+        "speak_facts": {},
+        "current_node": "extractor",
+    }
 
 
-def run_verify(turn: Turn, span) -> Step:
-    _enter("verify_id", turn.state, span)
-    turn.state, message = run_verify_id(turn.state)
-    turn.speak(message)
-    if turn.state.get("verified"):
-        return Step("advance")
-    return Step("stop", message)
+def verify_id_node(state: GraphState) -> dict[str, Any]:
+    _enter("verify_id", state)
+    agent, facts = run_verify_id(_agent_state(state), user_text=state.get("user_text") or "")
+    return _sop_result(agent, facts, "verify_id")
 
 
-def run_intent(turn: Turn, span) -> Step:
-    turn.state = {**turn.state, "phase": "RESOLVE_INTENT"}
-    _enter("resolve_intent", turn.state, span)
-    turn.state, message = run_resolve_intent(turn.state)
-    turn.speak(message)
-    if _case_is_ready(turn.state):
-        return Step("advance")
-    return Step("stop", message)
+def resolve_intent_node(state: GraphState) -> dict[str, Any]:
+    _enter("resolve_intent", state)
+    agent, facts = run_resolve_intent(
+        _agent_state(state),
+        user_text=state.get("user_text") or "",
+    )
+    return _sop_result(agent, facts, "resolve_intent")
 
 
-def run_case(turn: Turn, span) -> Step:
-    _enter("process_case", turn.state, span)
-    turn.state, message = run_process_case(turn.state, turn.user_text)
-    turn.speak(message)
-    if turn.state.get("phase") == "POST_PROCESS":
-        return Step("advance")
-    return Step("stop", message)
+def process_case_node(state: GraphState) -> dict[str, Any]:
+    _enter("process_case", state)
+    agent, facts = run_process_case(
+        _agent_state(state),
+        state.get("user_text") or "",
+        api_key=state.get("api_key"),
+    )
+    return _sop_result(agent, facts, "process_case")
 
 
-def run_post(turn: Turn, span) -> Step:
-    _enter("post_process", turn.state, span)
-    turn.state, message = run_post_process(turn.state, turn.user_text)
-    turn.speak(message)
-    if turn.state.get("phase") == "PROCESS_CASE":
-        return Step("advance")
-    return Step("stop", message)
+def post_process_node(state: GraphState) -> dict[str, Any]:
+    _enter("post_process", state)
+    agent, facts = run_post_process(
+        _agent_state(state),
+        state.get("user_text") or "",
+        api_key=state.get("api_key"),
+    )
+    return _sop_result(agent, facts, "post_process")
 
 
-SOP_NODES: dict[str, StepRunner] = {
-    "verify_id": run_verify,
-    "resolve_intent": run_intent,
-    "process_case": run_case,
-    "post_process": run_post,
-}
+def speak_node(state: GraphState) -> dict[str, Any]:
+    _enter("speak", state)
+    facts = dict(state.get("speak_facts") or {})
+    if not facts:
+        return {
+            "last_reply": "",
+            "speak_facts": {},
+            "halt": True,
+            "current_node": state.get("current_node") or "speak",
+        }
+    phase = str(facts.get("phase") or state.get("phase") or "VERIFY_ID")
+    text = phrase(PHASE_SYSTEM.get(phase, SOP_SYSTEM), facts, state.get("api_key"))
+    updates: dict[str, Any] = {
+        "last_reply": text,
+        "speak_facts": {},
+        "halt": True,
+        "current_node": state.get("current_node") or "speak",
+    }
+    if text:
+        remembered = memory_patch(state, last_agent_reply=text)
+        if phase == "PROCESS_CASE":
+            remembered = note_answer(remembered, text)
+        updates["memory"] = remembered["memory"]
+    return updates
+
+
+def already_done_node(state: GraphState) -> dict[str, Any]:
+    _enter("done", state)
+    return {"last_reply": DONE_REPLY, "halt": True, "speak_facts": {}, "current_node": "done", "phase": "DONE"}
+
+
+def already_escalated_node(state: GraphState) -> dict[str, Any]:
+    _enter("human_escalation", state)
+    return {
+        "last_reply": ALREADY_ESCALATED_REPLY,
+        "halt": True,
+        "speak_facts": {},
+        "current_node": "human_escalation",
+        "phase": "HUMAN_ESCALATION",
+    }
+
+
+def route_start(state: GraphState) -> str:
+    phase = state.get("phase")
+    if phase == "HUMAN_ESCALATION":
+        return "already_escalated"
+    if phase == "DONE":
+        return "already_done"
+    return "guardrails"
+
+
+def route_after_guardrails(state: GraphState) -> str:
+    if state.get("halt"):
+        return END
+    return "extractor"
+
+
+def route_after_extractor(state: GraphState) -> str:
+    if state.get("halt"):
+        return END
+    return next_node(state)
+
+
+def route_after_sop(state: GraphState) -> str:
+    if state.get("speak_facts"):
+        return "speak"
+    return next_node(state)
+
+
+def route_after_speak(state: GraphState) -> str:
+    return END
+
+
+@lru_cache(maxsize=1)
+def build_graph():
+    graph = StateGraph(GraphState)
+    graph.add_node("guardrails", guardrails_node)
+    graph.add_node("extractor", extractor_node)
+    graph.add_node("verify_id", verify_id_node)
+    graph.add_node("resolve_intent", resolve_intent_node)
+    graph.add_node("process_case", process_case_node)
+    graph.add_node("post_process", post_process_node)
+    graph.add_node("speak", speak_node)
+    graph.add_node("already_done", already_done_node)
+    graph.add_node("already_escalated", already_escalated_node)
+
+    graph.add_conditional_edges(START, route_start)
+    graph.add_conditional_edges("guardrails", route_after_guardrails)
+    graph.add_conditional_edges("extractor", route_after_extractor)
+    for node in ("verify_id", "resolve_intent", "process_case", "post_process"):
+        graph.add_conditional_edges(node, route_after_sop)
+    graph.add_conditional_edges("speak", route_after_speak)
+    graph.add_edge("already_done", END)
+    graph.add_edge("already_escalated", END)
+    return graph.compile()
+
+
+def _graph_input(user_text: str, state: AgentState, api_key: str | None) -> GraphState:
+    payload: GraphState = {**state}  # type: ignore[typeddict-item]
+    payload["user_text"] = user_text
+    payload["api_key"] = resolve_groq_api_key(api_key)
+    payload["last_reply"] = ""
+    payload["speak_facts"] = {}
+    payload["halt"] = False
+    payload["current_node"] = ""
+    return payload
 
 
 def iter_reply(
@@ -213,78 +328,28 @@ def iter_reply(
     state: AgentState,
     api_key: str | None = None,
 ) -> Iterator[ReplyEvent]:
-    """Run one SOP turn and stream status plus spoken text as nodes finish."""
-    turn = Turn(
-        user_text=user_text,
-        state=state,
-        api_key=resolve_groq_api_key(api_key),
-    )
+    """Stream status and spoken text as LangGraph nodes finish."""
+    graph = build_graph()
+    incoming = _graph_input(user_text, state, api_key)
+    latest: dict[str, Any] = dict(incoming)
 
-    with logfire.span("agent.reply", **safe_state_attrs(turn.state)) as span:
+    with logfire.span("agent.reply", **safe_state_attrs(state)) as span:
         span.set_attribute("sop_flow", " → ".join(SOP_FLOW))
-
-        def done(node: str, message: str | None = None) -> Iterator[ReplyEvent]:
-            if message:
-                turn.speak(message)
-            yield from _flush(turn, node)
-            text, updated = _finish(span, node, turn.state, turn.reply_text())
-            if text and not turn.spoken:
-                yield ReplyEvent(kind="text", text=text, node=node)
-            yield ReplyEvent(kind="done", node=node, state=updated)
-
-        phase = turn.state.get("phase")
-        if phase == "HUMAN_ESCALATION":
-            _enter("human_escalation", turn.state, span)
-            yield _status("human_escalation")
-            yield from done("already_escalated", ALREADY_ESCALATED_REPLY)
-            return
-        if phase == "DONE":
-            _enter("done", turn.state, span)
-            yield _status("done")
-            yield from done("done", DONE_REPLY)
-            return
-
-        yield _status("guardrails")
-        blocked = run_guardrails(turn, span)
-        if blocked.action == "stop":
-            yield from done("guardrails")
-            return
-
-        yield _status("extractor")
-        extracted = run_extractor(turn, span)
-        if extracted.action == "stop":
-            yield from done("already_escalated")
-            return
-
-        for _ in range(MAX_SAME_TURN_HOPS):
-            node = next_node(turn.state)
-            if node is None:
-                if turn.state.get("phase") == "HUMAN_ESCALATION":
-                    _enter("human_escalation", turn.state, span)
-                    yield _status("human_escalation")
-                    yield from done("already_escalated", ALREADY_ESCALATED_REPLY)
-                    return
-                if turn.state.get("phase") == "DONE":
-                    _enter("done", turn.state, span)
-                    yield _status("done")
-                    yield from done("done", DONE_REPLY)
-                    return
-                yield from done("sop_halted", HALTED_REPLY)
-                return
-
-            yield _status(node)
-            step = SOP_NODES[node](turn, span)
-            yield from _flush(turn, node)
-            if step.action == "advance":
-                continue
-            yield from done(node)
-            return
-
-        yield from done("sop_halted", HALTED_REPLY)
+        for update in graph.stream(incoming, stream_mode="updates", config={"recursion_limit": 12}):
+            for node, delta in update.items():
+                latest.update(delta)
+                span.set_attribute("current_node", node)
+                if node != "speak":
+                    yield ReplyEvent("status", NODE_STATUS.get(node, node), node)
+                text = str(delta.get("last_reply") or "").strip()
+                if text:
+                    yield ReplyEvent("text", text, str(latest.get("current_node") or node))
+        final = _agent_state(latest)
+        span.set_attributes(safe_state_attrs(final))
+        yield ReplyEvent("done", node=str(latest.get("current_node") or ""), state=final)
 
 
 def reply(user_text: str, state: AgentState, api_key: str | None = None) -> tuple[str, AgentState]:
-    """Run one SOP turn and return the assistant reply plus updated state."""
     parts: list[str] = []
     final = state
     for event in iter_reply(user_text, state, api_key=api_key):
