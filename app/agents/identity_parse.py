@@ -175,10 +175,13 @@ def parse_identity_utterance(user_text: str) -> dict[str, str]:
     if dob and re.fullmatch(r"\d{4}-\d{2}-\d{2}", dob):
         found["dob"] = dob
 
-    name = NAME_RE.search(text)
+    name = None
+    for match in NAME_RE.finditer(text):
+        cleaned = " ".join(match.group(1).strip(" .,;:").split())
+        if cleaned and cleaned.lower() not in {"the policyholder", "policyholder", "calling"}:
+            name = cleaned
+            break
     if name:
-        cleaned = " ".join(name.group(1).strip(" .,;:").split())
-        if cleaned and cleaned.lower() not in {"the policyholder", "calling"}:
-            found["name"] = cleaned
+        found["name"] = name
 
     return found

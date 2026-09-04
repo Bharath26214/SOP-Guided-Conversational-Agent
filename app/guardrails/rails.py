@@ -48,6 +48,13 @@ REPLIES: dict[str, str] = {
 
 def off_topic_reply(state: AgentState | None = None) -> str:
     stored = case_hint(state)
+    verified = bool((state or {}).get("verified"))
+    if verified:
+        return (
+            "I am happy to help with your insurance claim, but I cannot cover that topic. "
+            "If you have another question about this claim, I can take that. "
+            "If you would rather speak with a person, I can connect you with a human representative."
+        )
     noted = ""
     if stored.get("case_id"):
         noted = f"I still have claim {stored['case_id']} noted for after identity verification. "

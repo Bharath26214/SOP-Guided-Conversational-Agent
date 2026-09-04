@@ -13,7 +13,6 @@ def _clean_env(value: str | None) -> str:
     return value.strip().strip("'").strip('"')
 
 
-GROQ_API_KEY = _clean_env(os.getenv("GROQ_API_KEY"))
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
 LOGFIRE_TOKEN = _clean_env(os.getenv("LOGFIRE_TOKEN"))
@@ -36,4 +35,5 @@ configure_logfire()
 
 
 def resolve_groq_api_key(override: str | None = None) -> str:
-    return _clean_env(override) or GROQ_API_KEY
+    """Return the caller-provided Groq key only. No .env fallback."""
+    return _clean_env(override)

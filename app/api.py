@@ -38,7 +38,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     user_text: str = Field(..., min_length=1)
     state: dict[str, Any] | None = None
-    api_key: str | None = None
+    api_key: str = Field(..., min_length=1)
 
 
 class ChatResponse(BaseModel):
@@ -90,11 +90,14 @@ def create_session() -> SessionResponse:
 
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
+    api_key = resolve_groq_api_key(request.api_key)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="A Groq API key is required.")
     try:
         answer, updated = reply(
             user_text=request.user_text,
             state=_agent_state(request.state),
-            api_key=resolve_groq_api_key(request.api_key),
+            api_key=api_key,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -112,12 +115,16 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 @app.post("/v1/chat/stream")
 def chat_stream(request: ChatRequest) -> StreamingResponse:
+    api_key = resolve_groq_api_key(request.api_key)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="A Groq API key is required.")
+
     def events():
         try:
             for event in iter_reply(
                 user_text=request.user_text,
                 state=_agent_state(request.state),
-                api_key=resolve_groq_api_key(request.api_key),
+                api_key=api_key,
             ):
                 payload: dict[str, Any] = {
                     "kind": event.kind,

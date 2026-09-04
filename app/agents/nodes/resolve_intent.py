@@ -251,8 +251,8 @@ def _run_resolve_intent(state: AgentState, user_text: str = "") -> tuple[AgentSt
     caller_id = str(hint.get("case_id") or "").strip().upper()
     stored = get_claim(caller_id) if caller_id else None
     if stored and stored.get("party_id") == party_id:
-        selected = _select_claim(updated, stored, intent)
-        return selected, _facts(updated, {"status": "selected", "claim": _brief(stored), "from_memory": True})
+        # Unique id already known — brief the file this turn.
+        return _select_claim(updated, stored, intent), {}
     if caller_id:
         return updated, _facts(
             updated,
@@ -270,13 +270,12 @@ def _run_resolve_intent(state: AgentState, user_text: str = "") -> tuple[AgentSt
         in {str(item).upper() for item in (updated.get("candidate_case_ids") or []) if item}
     ]
     if len(listed) == 1 and _confirms_listed_claim(user_text) and not named:
-        selected = _select_claim(updated, listed[0], intent)
-        return selected, _facts(updated, {"status": "selected", "claim": _brief(listed[0]), "confirmed": True})
+        return _select_claim(updated, listed[0], intent), {}
 
     matched = filter_claims(claims, hint) if named else []
     if named and len(matched) == 1:
-        selected = _select_claim(updated, matched[0], intent)
-        return selected, _facts(updated, {"status": "selected", "claim": _brief(matched[0])})
+        # Hints such as "denied healthcare from January" uniquely match — open the file.
+        return _select_claim(updated, matched[0], intent), {}
 
     if named and len(matched) > 1:
         types = {str(claim.get("case_type") or "") for claim in matched}

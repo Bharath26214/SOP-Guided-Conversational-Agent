@@ -124,9 +124,24 @@ def matches_example(utterance: str, example: str) -> bool:
     if needle in haystack:
         return True
     words = _tokens(needle)
-    if len(words) < 2:
+    # Short Colang examples are too loose as bag-of-words
+    # ("what time is it" was matching claim deadline questions).
+    if len(words) < 3:
         return False
-    return all(word in haystack for word in words)
+    if not all(word in haystack for word in words):
+        return False
+    # Require content words to appear in order so trivia examples stay precise.
+    positions: list[int] = []
+    start = 0
+    hay_tokens = _tokens(haystack)
+    for word in words:
+        try:
+            index = hay_tokens.index(word, start)
+        except ValueError:
+            return False
+        positions.append(index)
+        start = index + 1
+    return True
 
 
 def first_matching_example(utterance: str, examples: tuple[str, ...]) -> str | None:
@@ -159,6 +174,23 @@ def _looks_like_claims_turn(utterance: str) -> bool:
         "last four",
         "phone number",
         "my name",
+        "document",
+        "documents",
+        "submit",
+        "submission",
+        "deadline",
+        "upload",
+        "missing",
+        "pathology",
+        "office note",
+        "diagnosis",
+        "status",
+        "amount",
+        "paid",
+        "net pay",
+        "net fee",
+        "allowed",
+        "portal",
     )
     return any(hint in text for hint in hints)
 
@@ -220,7 +252,7 @@ def classify_prompt_guard(user_text: str) -> dict[str, Any]:
 
     key = resolve_groq_api_key(_active_groq_api_key)
     if not key:
-        logfire.warning("Prompt Guard 2 skipped; GROQ_API_KEY is missing")
+        logfire.warning("Prompt Guard 2 skipped; Groq API key is missing")
         return {"available": False, "malicious": False, "label": None, "score": None}
 
     try:

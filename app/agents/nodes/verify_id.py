@@ -357,6 +357,9 @@ def _run_verify_id(state: AgentState, user_text: str = "") -> tuple[AgentState, 
         updated["verified"] = True
         updated["party_id"] = candidate["party_id"]
         updated["phase"] = "RESOLVE_INTENT"
+        # Caller already named a claim while verifying — look it up this turn.
+        if _noted_claim(updated):
+            return updated, {}
         return updated, pack(
             {"status": "verified", "representative": state.get("caller_role") == "representative"},
         )

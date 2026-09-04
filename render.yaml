@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sop-claims-agent
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash scripts/start_cloud.sh
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: BACKEND_URL
+        value: http://127.0.0.1:8000
+      - key: LOGFIRE_CONSOLE
+        value: "false"

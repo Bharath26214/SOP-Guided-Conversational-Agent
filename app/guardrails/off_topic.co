@@ -25,7 +25,8 @@ define user ask trivia
   "play a song"
   "how do I invest in stocks"
   "translate this to spanish"
-  "what time is it"
+  "what time is it right now"
+  "do you know what time it is"
 
 define flow check off topic
   $off_topic = execute check_off_topic
