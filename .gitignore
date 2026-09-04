@@ -11,4 +11,3 @@ build/
 .mypy_cache/
 .DS_Store
 *.db
-app/DATA/outbox/
